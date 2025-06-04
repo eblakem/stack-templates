@@ -301,7 +301,7 @@ modifyStoredIORef store f = withStore store $ \ref -> do
 
 {-# START_FILE Makefile #-}
 dev:
-  ghcid --command="stack ghci" --test ":main" --warnings
+	ghcid --command="stack ghci" --test ":main" --warnings
 
 {-# START_FILE .gitignore #-}
 .stack-work/
