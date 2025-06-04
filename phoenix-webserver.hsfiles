@@ -79,17 +79,224 @@ tests:
 import Distribution.Simple
 main = defaultMain
 
-{-# START_FILE src/Main.hs #-}
+{-# START_FILE app/Main.hs #-}
 module Main (main) where
 
-import Foundation
+import Lib 
 
 main :: IO ()
-main = do
-  putStrLn $ "hello " <> "world"
+main = runApp
 
-{-# START_FILE .ghci #-}
-:set -XOverloadedStrings
+{-# START_FILE src/Lib.hs #-}
+module Lib
+  ( runApp,
+  )
+where
+
+import qualified Api 
+import Control.Exception (bracket)
+import qualified Network.Wai.Handler.Warp as Warp
+import Servant.Server.Generic (genericServe)
+import qualified Session
+
+runApp :: IO ()
+runApp = bracket initApp shutdownApp startApp
+
+initApp :: IO Session.Session
+initApp = do 
+  session <- Session.mk "phoenix.db"
+  return session
+
+shutdownApp :: Session.Session -> IO ()
+shutdownApp session' = 
+  Session.destroy session'
+
+startApp :: Session.Session -> IO ()
+startApp session' = do 
+  putStrLn $ "Running on port " <> (show port)
+  Warp.run port $ genericServe $ Api.server session'
+  where 
+    port :: Int 
+    port = 8081
+
+{-# START_FILE src/Api.hs #-}
+module Api (server) where
+
+import Data.ByteString.Lazy qualified as BS
+import GHC.Generics (Generic)
+import Network.HTTP.Types (ok200)
+import Network.Wai (responseLBS)
+import Servant
+import Servant.Server.Generic (AsServer)
+import Session qualified
+
+data Routes mode = Routes
+  { publicRoutes :: mode :- Servant.NamedRoutes PublicRoutes
+  }
+  deriving (Generic)
+
+data PublicRoutes mode = PublicRoutes
+  { assets :: mode :- "assets" :> Servant.Raw,
+    client :: mode :- Servant.Raw
+  }
+  deriving (Generic)
+
+server :: Session.Session -> Routes AsServer
+server _ =
+  Routes
+    { publicRoutes =
+        PublicRoutes
+          { assets = Servant.serveDirectoryWebApp "public/assets",
+            client = return serveClient
+          }
+    }
+
+serveClient :: Servant.Application
+serveClient _ response = do
+  contents <- BS.readFile "public/index.html"
+  response $
+    responseLBS ok200 [html] contents
+  where
+    html = ("Content-Type", "text/html; charset=UTF-8")
+
+{-# START_FILE src/Session.hs #-}
+module Session
+  ( mk,
+    withSql,
+    destroy,
+    Session,
+  )
+where
+
+import Data.Pool qualified as Pool
+import Database.SQLite.Simple as SQL
+
+data Session = MkSession
+  { _dbPool :: Pool.Pool SQL.Connection
+  }
+
+mk :: String -> IO Session
+mk dbName' = do
+  pool <- Pool.newPool $ Pool.defaultPoolConfig (SQL.open dbName') (SQL.close) 10 10
+  return $
+    MkSession
+      { _dbPool = pool
+      }
+
+withSql :: (SQL.Connection -> IO a) -> Session -> IO a
+withSql action (MkSession {_dbPool}) =
+  Pool.withResource _dbPool action
+
+destroy :: Session -> IO ()
+destroy (MkSession {_dbPool}) =
+  Pool.destroyAllResources _dbPool
+
+{-# START_FILE src/DevelMain.hs #-}
+module DevelMain (update, shutdown) where
+
+import Control.Concurrent
+    ( MVar
+    , ThreadId
+    , forkIO
+    , killThread
+    , newEmptyMVar
+    , putMVar
+    , takeMVar
+    )
+import Control.Exception (finally)
+import Control.Monad ((>=>))
+import Data.IORef
+    ( IORef
+    , newIORef
+    , readIORef
+    , writeIORef
+    )
+import Foreign.Store
+    ( Store (..)
+    , lookupStore
+    , readStore
+    , storeAction
+    , withStore
+    )
+import GHC.Word (Word32)
+import Lib (runApp)
+import Prelude
+
+-- | Start or restart the server.
+
+-- newStore is from foreign-store.
+
+-- A Store holds onto some data across ghci reloads
+
+update :: IO ()
+update = do
+    mtidStore <- lookupStore tidStoreNum
+    case mtidStore of
+        -- no server running
+
+        Nothing -> do
+            done <- storeAction doneStore newEmptyMVar
+            tid <- start done
+            _ <- storeAction (Store tidStoreNum) (newIORef tid)
+            return ()
+        -- server is already running
+
+        Just tidStore -> restartAppInNewThread tidStore
+    where
+        doneStore :: Store (MVar ())
+        doneStore = Store 0
+
+        -- shut the server down with killThread and wait for the done signal
+
+        restartAppInNewThread :: Store (IORef ThreadId) -> IO ()
+        restartAppInNewThread tidStore = modifyStoredIORef tidStore $ \tid -> do
+            killThread tid
+            withStore doneStore takeMVar
+            readStore doneStore >>= start
+
+        start
+            -- \| Written to when the thread is killed.
+            :: MVar () -> IO ThreadId
+        start done =
+            forkIO
+                ( finally
+                    runApp
+                    -- Note that this implies concurrency
+
+                    -- between shutdownApp and the next app that is starting.
+
+                    -- Normally this should be fine
+
+                    (putMVar done ())
+                )
+
+-- | kill the server
+shutdown :: IO ()
+shutdown = do
+    mtidStore <- lookupStore tidStoreNum
+    case mtidStore of
+        -- no server running
+
+        Nothing -> putStrLn "no app running"
+        Just tidStore -> do
+            withStore tidStore $ readIORef >=> killThread
+            putStrLn "App is shutdown"
+
+tidStoreNum :: Word32
+tidStoreNum = 1
+
+modifyStoredIORef :: Store (IORef a) -> (a -> IO a) -> IO ()
+modifyStoredIORef store f = withStore store $ \ref -> do
+    v <- readIORef ref
+    f v >>= writeIORef ref
+
+{-# START_FILE Makefile #-}
+dev:
+  ghcid --command="stack ghci" --test ":main" --warnings
+
+{-# START_FILE .gitignore #-}
+.stack-work/
+*~
 
 {-# START_FILE README.md #-}
 # {{name}}
